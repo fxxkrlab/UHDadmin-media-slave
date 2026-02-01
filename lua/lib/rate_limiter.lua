@@ -1,10 +1,11 @@
 -- rate_limiter.lua: L1 rate limiting using shared_dict
 -- Implements token bucket algorithm for req/s and req/min.
+-- Only handles volatile, short-lived rate limits. Long-lived quota
+-- counters and enforcements are handled by redis_store.lua.
 
 local _M = {}
 
 local rate_dict = ngx.shared.rate_limit
-local enf_dict = ngx.shared.enforcement_cache
 
 --- Check rate limit for a key (e.g., "ip:1.2.3.4" or "user:abc123")
 -- @param key string: the rate limit key
@@ -59,70 +60,6 @@ function _M.check_minute_rate(key, limit)
 
     rate_dict:incr(mkey, 1)
     return true
-end
-
---- Increment quota counter in shared dict (for periodic sync to Redis/UHDadmin)
--- @param dimension string: 'ip', 'user', 'device'
--- @param dimension_value string: the actual value
--- @param bytes number: bytes transferred (for bandwidth quota)
-function _M.increment_quota(dimension, dimension_value, bytes)
-    if not dimension or not dimension_value then
-        return
-    end
-
-    -- Request counter
-    local req_key = "q:req:" .. dimension .. ":" .. dimension_value
-    local current = rate_dict:get(req_key)
-    if current then
-        rate_dict:incr(req_key, 1)
-    else
-        rate_dict:set(req_key, 1, 3600)  -- 1 hour TTL
-    end
-
-    -- Bandwidth counter
-    if bytes and bytes > 0 then
-        local bw_key = "q:bw:" .. dimension .. ":" .. dimension_value
-        local bw_current = rate_dict:get(bw_key)
-        if bw_current then
-            rate_dict:incr(bw_key, bytes)
-        else
-            rate_dict:set(bw_key, bytes, 3600)
-        end
-    end
-end
-
---- Check if an enforcement is active for the given dimension
--- @param dimension string
--- @param dimension_value string
--- @return table|nil: enforcement entry if active, nil otherwise
-function _M.check_enforcement(dimension, dimension_value)
-    local cjson = require("cjson.safe")
-    local enf_raw = enf_dict:get("enforcements")
-    if not enf_raw then
-        return nil
-    end
-
-    local enforcements = cjson.decode(enf_raw)
-    if not enforcements then
-        return nil
-    end
-
-    for _, e in ipairs(enforcements) do
-        if e.dimension == dimension and e.dimension_value == dimension_value then
-            return e
-        end
-    end
-
-    return nil
-end
-
---- Store enforcements in cache (called by agent after config pull)
-function _M.store_enforcements(enforcements)
-    local cjson = require("cjson.safe")
-    local json = cjson.encode(enforcements)
-    if json then
-        enf_dict:set("enforcements", json, 600)  -- 10 min TTL
-    end
 end
 
 return _M

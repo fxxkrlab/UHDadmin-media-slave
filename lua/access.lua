@@ -1,12 +1,21 @@
 -- access.lua: Main access control entry point (access_by_lua_file)
 -- Runs for every request in the access phase.
--- Loads config from shared dict, enforces client whitelist, URI rules,
--- rate limits, enforcements, and fake counts.
+--
+-- Check order:
+--   1. URI skip list (streaming bypass)
+--   2. URI block list
+--   3. Client detection
+--   4. L2 Redis: enforcement check (ban/throttle)
+--   5. L1 shared_dict: req/s + req/min rate limit
+--   6. L2 Redis: remaining quota check (daily/monthly)
+--   7. Client whitelist + version
+--   8. Fake counts interception
 
 local cjson = require("cjson.safe")
 local config = require("config")
 local client_detect = require("client_detect")
 local rate_limiter = require("rate_limiter")
+local redis_store = require("redis_store")
 local telemetry = require("telemetry")
 
 -- ==================== Helper Functions ====================
@@ -41,7 +50,7 @@ end
 
 local uri = ngx.var.uri or ""
 
--- ==================== URI Skip List (streaming bypass) ====================
+-- ==================== 1. URI Skip List (streaming bypass) ====================
 
 local skip_list = lua_cfg.skip_list or {}
 for _, rule in ipairs(skip_list) do
@@ -63,7 +72,7 @@ for _, rule in ipairs(skip_list) do
     end
 end
 
--- ==================== URI Block List ====================
+-- ==================== 2. URI Block List ====================
 
 local block_list = lua_cfg.block_list or {}
 for _, rule in ipairs(block_list) do
@@ -92,7 +101,7 @@ for _, rule in ipairs(block_list) do
     end
 end
 
--- ==================== Client Detection ====================
+-- ==================== 3. Client Detection ====================
 
 local client_name = client_detect.get_client_name()
 local client_version = client_detect.get_client_version()
@@ -106,53 +115,37 @@ ngx.ctx.client_version = client_version
 ngx.ctx.device_id = device_id
 ngx.ctx.user_id = user_id
 
--- ==================== Enforcement Check ====================
+-- ==================== 4. L2 Redis: Enforcement Check ====================
 -- Check if there's an active enforcement (ban/throttle) for this IP/user/device
 
-local function check_all_enforcements()
-    -- Check IP enforcement
-    local enf = rate_limiter.check_enforcement("ip", client_ip)
-    if enf then return enf end
-
-    -- Check user enforcement
-    if user_id then
-        enf = rate_limiter.check_enforcement("user", user_id)
-        if enf then return enf end
-    end
-
-    -- Check device enforcement
-    if device_id then
-        enf = rate_limiter.check_enforcement("device", device_id)
-        if enf then return enf end
-    end
-
-    return nil
-end
-
-local enforcement = check_all_enforcements()
-if enforcement then
-    if enforcement.action == "reject" then
-        ngx.log(ngx.WARN, "Enforcement reject: ", enforcement.dimension, "=",
-                enforcement.dimension_value, " reason=", enforcement.reason or "quota")
-        telemetry.log_blocked({
-            reason = "enforcement_reject",
-            enforcement_id = enforcement.id,
-            dimension = enforcement.dimension,
-            dimension_value = enforcement.dimension_value,
-            ip = client_ip,
-            uri = uri,
-            timestamp = ngx.now(),
-        })
-        return deny_request(ngx.HTTP_FORBIDDEN,
-            enforcement.reason or "访问受限")
-    end
-    -- throttle: store in ctx for log phase (bandwidth limiting is handled at proxy level)
-    if enforcement.action == "throttle" then
-        ngx.ctx.throttle_rate_bps = enforcement.throttle_rate_bps
+local function check_redis_enforcement(dimension, value)
+    if not value then return nil end
+    local enf = redis_store.check_enforcement(dimension, value)
+    if enf then
+        if enf.action == "reject" then
+            ngx.log(ngx.WARN, "Enforcement reject: ", dimension, "=", value,
+                    " reason=", enf.reason or "quota")
+            telemetry.log_blocked({
+                reason = "enforcement_reject",
+                dimension = dimension,
+                dimension_value = value,
+                ip = client_ip,
+                uri = uri,
+                timestamp = ngx.now(),
+            })
+            return deny_request(ngx.HTTP_FORBIDDEN, enf.reason or "访问受限")
+        end
+        if enf.action == "throttle" then
+            ngx.ctx.throttle_rate_bps = enf.throttle_rate_bps
+        end
     end
 end
 
--- ==================== Rate Limiting ====================
+check_redis_enforcement("ip", client_ip)
+check_redis_enforcement("user", user_id)
+check_redis_enforcement("device", device_id)
+
+-- ==================== 5. L1 shared_dict: Rate Limiting ====================
 
 local rate_cfg = config.get_rate_limit_config()
 if rate_cfg and rate_cfg.rules then
@@ -199,7 +192,6 @@ if rate_cfg and rate_cfg.rules then
                     if rule.over_action == "reject" then
                         return deny_request(429, "请求过于频繁，请稍后再试")
                     end
-                    -- throttle: mark for bandwidth limiting
                     if rule.over_action == "throttle" and rule.throttle_rate_bps then
                         ngx.ctx.throttle_rate_bps = rule.throttle_rate_bps
                     end
@@ -231,7 +223,48 @@ if rate_cfg and rate_cfg.rules then
     end
 end
 
--- ==================== Client Whitelist ====================
+-- ==================== 6. L2 Redis: Remaining Quota Check ====================
+
+local function check_remaining_quota(dimension, value)
+    if not value then return end
+
+    local req_left, bw_left = redis_store.get_remaining(dimension, value)
+
+    -- req_left/bw_left = nil means no quota set for this dimension (allow)
+    if req_left and req_left <= 0 then
+        ngx.log(ngx.WARN, "Quota exhausted (requests): ", dimension, "=", value,
+                " remaining=", req_left)
+        telemetry.log_blocked({
+            reason = "quota_requests_exhausted",
+            dimension = dimension,
+            dimension_value = value,
+            ip = client_ip,
+            uri = uri,
+            timestamp = ngx.now(),
+        })
+        return deny_request(429, "请求配额已用尽，请稍后再试")
+    end
+
+    if bw_left and bw_left <= 0 then
+        ngx.log(ngx.WARN, "Quota exhausted (bandwidth): ", dimension, "=", value,
+                " remaining=", bw_left)
+        telemetry.log_blocked({
+            reason = "quota_bandwidth_exhausted",
+            dimension = dimension,
+            dimension_value = value,
+            ip = client_ip,
+            uri = uri,
+            timestamp = ngx.now(),
+        })
+        return deny_request(429, "流量配额已用尽，请稍后再试")
+    end
+end
+
+check_remaining_quota("ip", client_ip)
+check_remaining_quota("user", user_id)
+check_remaining_quota("device", device_id)
+
+-- ==================== 7. Client Whitelist ====================
 
 local deny_message = lua_cfg.deny_message or "请使用允许的客户端进行访问"
 
@@ -281,7 +314,7 @@ if client_name then
     end
 end
 
--- ==================== Fake Counts (Items/Counts interception) ====================
+-- ==================== 8. Fake Counts (Items/Counts interception) ====================
 
 if lua_cfg.fake_counts_enabled then
     local function is_items_counts_request()
@@ -323,5 +356,4 @@ if lua_cfg.fake_counts_enabled then
 end
 
 -- ==================== Set Detail Preload Header ====================
--- Disable detail preload for all requests (configurable)
 ngx.header["X-DetailPreload-Bytes"] = "-1"

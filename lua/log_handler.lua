@@ -1,9 +1,10 @@
 -- log_handler.lua: Log phase handler (log_by_lua_file)
 -- Collects telemetry data after the request is proxied.
+-- Increments Redis quota counters and decrements remaining capacity.
 -- Runs in the log phase, so it cannot modify the response.
 
 local telemetry = require("telemetry")
-local rate_limiter = require("rate_limiter")
+local redis_store = require("redis_store")
 
 -- Collect request info from ngx variables and ctx
 local client_name = ngx.ctx.client_name
@@ -16,7 +17,8 @@ local request_time = tonumber(ngx.var.request_time) or 0
 local upstream_response_time = tonumber(ngx.var.upstream_response_time) or 0
 local status = ngx.var.status
 
--- Log access entry to telemetry buffer
+-- ==================== Telemetry Buffer (shared_dict) ====================
+
 telemetry.log_access({
     ip = client_ip,
     uri = ngx.var.uri,
@@ -33,16 +35,29 @@ telemetry.log_access({
     timestamp = ngx.now(),
 })
 
--- Increment quota counters for periodic sync to UHDadmin
--- Count by IP
-rate_limiter.increment_quota("ip", client_ip, bytes_sent)
+-- ==================== Redis Quota Counters + Remaining ====================
 
--- Count by user (if identified)
-if user_id then
-    rate_limiter.increment_quota("user", user_id, bytes_sent)
+-- Period keys for quota tracking
+local date = os.date("!*t")  -- UTC
+local daily_key = os.date("!%Y-%m-%d")
+local monthly_key = os.date("!%Y-%m")
+
+-- TTLs: daily=86400, monthly=2678400 (31 days)
+local DAILY_TTL = 86400
+local MONTHLY_TTL = 2678400
+
+-- Helper: increment counters + decrement remaining for one dimension
+local function track_dimension(dimension, value)
+    if not value then return end
+
+    -- Increment quota counters in Redis (absolute, persisted)
+    redis_store.incr_quota(dimension, value, "daily", daily_key, 1, bytes_sent, DAILY_TTL)
+    redis_store.incr_quota(dimension, value, "monthly", monthly_key, 1, bytes_sent, MONTHLY_TTL)
+
+    -- Decrement local remaining capacity (keeps it accurate between syncs)
+    redis_store.decr_remaining(dimension, value, bytes_sent)
 end
 
--- Count by device (if identified)
-if device_id then
-    rate_limiter.increment_quota("device", device_id, bytes_sent)
-end
+track_dimension("ip", client_ip)
+track_dimension("user", user_id)
+track_dimension("device", device_id)

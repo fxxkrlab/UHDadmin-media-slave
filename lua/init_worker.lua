@@ -2,19 +2,19 @@
 -- Starts periodic timers for:
 -- 1. Config pull from UHDadmin
 -- 2. Telemetry flush (access logs + blocked requests)
--- 3. Quota sync (upload counters to UHDadmin)
+-- 3. Quota sync (Redis counters → UHDadmin → remaining capacity back to Redis)
 -- 4. Heartbeat
 
 local cjson = require("cjson.safe")
 local config = require("config")
 local telemetry = require("telemetry")
-local rate_limiter = require("rate_limiter")
+local redis_store = require("redis_store")
 
 -- ==================== Environment Config ====================
 
 local UHDADMIN_URL = os.getenv("UHDADMIN_URL") or "http://localhost:8000"
 local APP_TOKEN = os.getenv("APP_TOKEN") or ""
-local AGENT_VERSION = "1.0.0"
+local AGENT_VERSION = "0.1.0"
 
 -- Timer intervals (seconds)
 local CONFIG_PULL_INTERVAL = tonumber(os.getenv("CONFIG_PULL_INTERVAL")) or 30
@@ -85,7 +85,6 @@ local function pull_config(premature)
 
     local current_version = config.get_version()
     if not ver_data.has_update and ver_data.version <= current_version then
-        -- No update needed
         goto schedule
     end
 
@@ -104,19 +103,19 @@ local function pull_config(premature)
             goto schedule
         end
 
-        -- Store lua config
+        -- Store lua config in shared_dict
         if cfg_data.lua_config then
             config.store_lua_config(cfg_data.lua_config)
             ngx.log(ngx.INFO, "Lua config updated")
         end
 
-        -- Store rate limit config
+        -- Store rate limit config in shared_dict
         if cfg_data.rate_limit_config then
             config.store_rate_limit_config(cfg_data.rate_limit_config)
 
-            -- Store enforcements in enforcement cache for fast lookup
+            -- Store enforcements in Redis for persistent access
             if cfg_data.rate_limit_config.enforcements then
-                rate_limiter.store_enforcements(cfg_data.rate_limit_config.enforcements)
+                redis_store.store_enforcements(cfg_data.rate_limit_config.enforcements)
             end
 
             ngx.log(ngx.INFO, "Rate limit config updated")
@@ -135,7 +134,6 @@ local function pull_config(premature)
         ngx.log(ngx.INFO, "Config updated to version ", cfg_data.version)
 
         -- Send ACK to UHDadmin
-        -- Find snapshot_id from version check response
         if ver_data.snapshot_id then
             api_request("POST", "/ack", {
                 snapshot_id = ver_data.snapshot_id,
@@ -191,72 +189,45 @@ local function flush_telemetry(premature)
 end
 
 -- ==================== Quota Sync ====================
+-- Read counters from Redis, report to UHDadmin, store remaining back to Redis
 
 local function sync_quotas(premature)
     if premature then return end
 
-    local rate_dict = ngx.shared.rate_limit
+    -- Scan all quota counters from Redis
+    local counters = redis_store.scan_quota_counters()
 
-    -- Collect quota counters from shared dict
-    local counters = {}
-    local keys = rate_dict:get_keys(2000)
-
-    for _, key in ipairs(keys) do
-        -- Match quota keys: q:req:<dim>:<val> and q:bw:<dim>:<val>
-        local qtype, dimension, dimension_value = key:match("^q:(%a+):(%a+):(.+)$")
-        if qtype and dimension and dimension_value then
-            local value = rate_dict:get(key)
-            if value and value > 0 then
-                -- Find or create counter entry
-                local counter_key = dimension .. ":" .. dimension_value
-                if not counters[counter_key] then
-                    counters[counter_key] = {
-                        dimension = dimension,
-                        dimension_value = dimension_value,
-                        request_count = 0,
-                        bandwidth_bytes = 0,
-                    }
-                end
-                if qtype == "req" then
-                    counters[counter_key].request_count = value
-                elseif qtype == "bw" then
-                    counters[counter_key].bandwidth_bytes = value
-                end
-            end
-        end
-    end
-
-    -- Convert to list and send
-    local counter_list = {}
-    for _, c in pairs(counters) do
-        counter_list[#counter_list + 1] = c
-    end
-
-    if #counter_list > 0 then
+    if #counters > 0 then
+        -- Report to UHDadmin and receive remaining capacity
         local resp, err = api_request("POST", "/../slave/telemetry/quota-sync", {
-            counters = counter_list,
+            counters = counters,
         })
+
         if not resp then
             ngx.log(ngx.ERR, "Quota sync failed: ", err)
         else
-            ngx.log(ngx.INFO, "Synced ", #counter_list, " quota counters")
-            -- Reset synced counters
-            for _, key in ipairs(keys) do
-                if key:sub(1, 2) == "q:" then
-                    rate_dict:delete(key)
-                end
+            ngx.log(ngx.INFO, "Synced ", #counters, " quota counters")
+
+            -- Store remaining capacity from UHDadmin response into Redis
+            if resp.data and resp.data.remaining then
+                redis_store.store_remaining(resp.data.remaining)
+                ngx.log(ngx.INFO, "Updated ", #resp.data.remaining, " remaining quotas")
+            end
+
+            -- Store enforcements from response into Redis
+            if resp.data and resp.data.enforcements then
+                redis_store.store_enforcements(resp.data.enforcements)
+                ngx.log(ngx.INFO, "Updated ", #resp.data.enforcements, " enforcements")
             end
         end
     end
 
-    -- Also pull latest enforcements
+    -- Also pull latest enforcements + rate limit rules independently
     local enf_resp, enf_err = api_request("GET", "/rate-limits")
     if enf_resp and enf_resp.data then
         if enf_resp.data.enforcements then
-            rate_limiter.store_enforcements(enf_resp.data.enforcements)
-            ngx.log(ngx.INFO, "Updated ", #enf_resp.data.enforcements, " enforcements")
+            redis_store.store_enforcements(enf_resp.data.enforcements)
         end
-        -- Also update rate limit rules in config
         if enf_resp.data.rules then
             config.store_rate_limit_config(enf_resp.data)
         end
@@ -296,7 +267,7 @@ end
 -- Only start on worker 0 to avoid duplicate API calls from multiple workers
 
 if ngx.worker.id() == 0 then
-    ngx.log(ngx.INFO, "UHD Slave agent starting on worker 0")
+    ngx.log(ngx.INFO, "UHD Slave agent v", AGENT_VERSION, " starting on worker 0")
     ngx.log(ngx.INFO, "UHDadmin URL: ", UHDADMIN_URL)
 
     -- Initial config pull (delay 1s to let nginx fully start)

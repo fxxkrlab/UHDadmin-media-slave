@@ -7,11 +7,17 @@ services:
       dockerfile: Dockerfile
     container_name: uhd-slave
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
       - "${LISTEN_PORT:-8443}:443"
       - "${LISTEN_HTTP_PORT:-8080}:80"
     env_file:
       - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     volumes:
       # SSL certificates (mount from host)
       - ${SSL_CERT_PATH:-./certs/cert.pem}:/etc/ssl/slave/cert.pem:ro
@@ -28,6 +34,30 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: uhd-slave-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save 60 100
+      --loglevel warning
+    volumes:
+      - redis-data:/data
+    networks:
+      - uhd-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis-data:
 
 networks:
   uhd-network:
