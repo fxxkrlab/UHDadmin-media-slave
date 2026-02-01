@@ -4,10 +4,11 @@
 -- Check order:
 --   1. URI skip list (streaming bypass)
 --   2. URI block list
---   3. Client detection
+--   3. Client detection + Token→User reverse lookup
 --   4. L2 Redis: enforcement check (ban/throttle)
 --   5. L1 shared_dict: req/s + req/min rate limit
 --   6. L2 Redis: remaining quota check (daily/monthly)
+--   6b. Concurrent stream check (PlaySessionId-based)
 --   7. Client whitelist + version
 --   8. Fake counts interception
 
@@ -106,14 +107,60 @@ end
 local client_name = client_detect.get_client_name()
 local client_version = client_detect.get_client_version()
 local device_id = client_detect.get_device_id()
+local device_name = client_detect.get_device_name()
 local user_id = client_detect.get_user_id()
+local token = client_detect.get_token()
+local play_session_id = client_detect.get_play_session_id()
 local client_ip = ngx.var.remote_addr
 
--- Store in ngx.ctx for log phase
+-- Token → User reverse lookup: if user_id is missing, try to resolve from token cache
+if token then
+    if not user_id then
+        local token_info = redis_store.get_token_map(token)
+        if token_info then
+            user_id = token_info.user_id
+            if not device_id and token_info.device_id then
+                device_id = token_info.device_id
+            end
+            if not device_name and token_info.device_name then
+                device_name = token_info.device_name
+            end
+            if not client_name and token_info.client_name then
+                client_name = token_info.client_name
+            end
+        end
+    else
+        -- user_id is known, refresh token TTL
+        redis_store.touch_token_map(token)
+    end
+end
+
+-- Fallback: device_id → user_id mapping (from Plan B Emby Sessions API resolve)
+if not user_id and device_id then
+    local red, _ = redis_store.connect()
+    if red then
+        local raw = red:get("device_user:" .. device_id)
+        redis_store.keepalive(red)
+        if raw and raw ~= ngx.null then
+            local info = cjson.decode(raw)
+            if info and info.user_id then
+                user_id = info.user_id
+                if not device_name and info.device_name then
+                    device_name = info.device_name
+                end
+            end
+        end
+    end
+end
+
+-- Store in ngx.ctx for log phase and body_filter
 ngx.ctx.client_name = client_name
 ngx.ctx.client_version = client_version
 ngx.ctx.device_id = device_id
+ngx.ctx.device_name = device_name
 ngx.ctx.user_id = user_id
+ngx.ctx.token = token
+ngx.ctx.play_session_id = play_session_id
 
 -- ==================== 4. L2 Redis: Enforcement Check ====================
 -- Check if there's an active enforcement (ban/throttle) for this IP/user/device
@@ -263,6 +310,44 @@ end
 check_remaining_quota("ip", client_ip)
 check_remaining_quota("user", user_id)
 check_remaining_quota("device", device_id)
+
+-- ==================== 6b. Concurrent Stream Check ====================
+-- Only applies when a PlaySessionId is present (streaming requests)
+
+if play_session_id and user_id then
+    local is_new = not redis_store.session_exists(user_id, play_session_id)
+    if is_new then
+        -- New stream: check concurrent limit
+        local concurrent_cfg = lua_cfg.concurrent_streams
+        if concurrent_cfg and concurrent_cfg.max_streams then
+            local active_count = redis_store.count_user_sessions(user_id)
+            if active_count >= concurrent_cfg.max_streams then
+                ngx.log(ngx.WARN, "Concurrent stream limit: user=", user_id,
+                        " active=", active_count, " max=", concurrent_cfg.max_streams)
+                telemetry.log_blocked({
+                    reason = "concurrent_stream_limit",
+                    user_id = user_id,
+                    play_session_id = play_session_id,
+                    active_count = active_count,
+                    max_streams = concurrent_cfg.max_streams,
+                    ip = client_ip,
+                    uri = uri,
+                    timestamp = ngx.now(),
+                })
+                return deny_request(429, concurrent_cfg.deny_message or "同时播放流数量已达上限")
+            end
+        end
+
+        -- Register this new session
+        redis_store.register_session(user_id, play_session_id, {
+            device_id = device_id,
+            device_name = device_name,
+            client_name = client_name,
+            client_ip = client_ip,
+            item_id = nil,  -- populated in log phase if available
+        })
+    end
+end
 
 -- ==================== 7. Client Whitelist ====================
 

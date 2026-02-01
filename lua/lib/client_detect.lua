@@ -168,6 +168,38 @@ function _M.get_token()
     return args["X-Emby-Token"] or args["api_key"]
 end
 
+--- Extract device name (human-readable, e.g. "iPhone 15", "Living Room TV")
+function _M.get_device_name()
+    local headers = ngx.req.get_headers()
+
+    -- X-Emby-Authorization: Device="xxx"
+    local emby_auth = headers["X-Emby-Authorization"]
+    if emby_auth then
+        local name = emby_auth:match('Device="(.-)"')
+        if name then return urldecode(name) end
+    end
+
+    local auth = headers["Authorization"]
+    if auth then
+        local name = auth:match('Device="(.-)"')
+        if name then return urldecode(name) end
+    end
+
+    return nil
+end
+
+--- Extract PlaySessionId from query parameters (present on streaming URLs)
+function _M.get_play_session_id()
+    local args = ngx.req.get_uri_args()
+    return args["PlaySessionId"] or args["playSessionId"] or args["playsessionid"]
+end
+
+--- Extract MediaSourceId from query parameters
+function _M.get_media_source_id()
+    local args = ngx.req.get_uri_args()
+    return args["MediaSourceId"] or args["mediasourceid"]
+end
+
 --- Semantic version comparison: returns true if current >= required
 function _M.is_version_sufficient(current, required)
     if not current or not required then

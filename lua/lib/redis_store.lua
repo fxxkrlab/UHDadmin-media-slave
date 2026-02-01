@@ -264,6 +264,250 @@ function _M.decr_remaining(dimension, value, bw_bytes)
     _M.keepalive(red)
 end
 
+-- ==================== Token Map Operations ====================
+
+local TOKEN_MAP_TTL = 604800  -- 7 days
+
+--- Store a token → user mapping (from login intercept or API resolve)
+-- @param token string: Emby access token
+-- @param info table: {user_id, username, device_id, device_name, client_name, client_version}
+function _M.set_token_map(token, info)
+    if not token or not info then return nil end
+
+    local red, err = _M.connect()
+    if not red then return nil, err end
+
+    local key = "token_map:" .. token
+    local json = cjson.encode(info)
+    if not json then
+        _M.keepalive(red)
+        return nil, "json encode failed"
+    end
+
+    red:set(key, json, "EX", TOKEN_MAP_TTL)
+
+    -- Also mark for pending report to UHDadmin
+    local report_key = "token_report:" .. ngx.now() .. ":" .. math.random(100000)
+    info.token = token
+    local report_json = cjson.encode(info)
+    if report_json then
+        red:set(report_key, report_json, "EX", 600)  -- 10 min TTL for report queue
+    end
+
+    _M.keepalive(red)
+    return true
+end
+
+--- Get token → user mapping
+-- @param token string
+-- @return table or nil: {user_id, username, device_id, device_name, ...}
+function _M.get_token_map(token)
+    if not token then return nil end
+
+    local red, err = _M.connect()
+    if not red then return nil end
+
+    local key = "token_map:" .. token
+    local raw = red:get(key)
+    _M.keepalive(red)
+
+    if not raw or raw == ngx.null then
+        return nil
+    end
+
+    return cjson.decode(raw)
+end
+
+--- Refresh token map TTL (called on each request with known token)
+function _M.touch_token_map(token)
+    if not token then return end
+
+    local red, err = _M.connect()
+    if not red then return end
+
+    local key = "token_map:" .. token
+    red:expire(key, TOKEN_MAP_TTL)
+    _M.keepalive(red)
+end
+
+--- Scan pending token reports (for flush to UHDadmin)
+-- @param max number: max items to return
+-- @return table of token info items
+function _M.scan_token_reports(max)
+    local red, err = _M.connect()
+    if not red then return {} end
+
+    local reports = {}
+    local cursor = "0"
+
+    repeat
+        local res = red:scan(cursor, "MATCH", "token_report:*", "COUNT", 100)
+        if not res then break end
+
+        cursor = res[1]
+        for _, key in ipairs(res[2]) do
+            local raw = red:get(key)
+            if raw and raw ~= ngx.null then
+                local item = cjson.decode(raw)
+                if item then
+                    reports[#reports + 1] = item
+                    red:del(key)
+                end
+            end
+            if #reports >= (max or 100) then break end
+        end
+    until cursor == "0" or #reports >= (max or 100)
+
+    _M.keepalive(red)
+    return reports
+end
+
+-- ==================== Active Session Operations ====================
+
+local SESSION_TTL = 90  -- seconds, auto-expire if no streaming requests
+
+--- Register or refresh an active session
+-- @param user_id string
+-- @param play_session_id string
+-- @param info table: {device_id, device_name, client_name, item_id, ...}
+function _M.register_session(user_id, play_session_id, info)
+    if not user_id or not play_session_id then return nil end
+
+    local red, err = _M.connect()
+    if not red then return nil, err end
+
+    local key = "active_session:" .. user_id .. ":" .. play_session_id
+    local existing = red:get(key)
+
+    if existing and existing ~= ngx.null then
+        -- Refresh TTL + update bytes_sent
+        local data = cjson.decode(existing)
+        if data and info.bytes_sent then
+            data.bytes_sent = (data.bytes_sent or 0) + (info.bytes_sent or 0)
+            data.last_seen = ngx.now()
+            red:set(key, cjson.encode(data), "EX", SESSION_TTL)
+        else
+            red:expire(key, SESSION_TTL)
+        end
+    else
+        -- New session
+        info.started_at = info.started_at or ngx.now()
+        info.last_seen = ngx.now()
+        info.bytes_sent = info.bytes_sent or 0
+        local json = cjson.encode(info)
+        if json then
+            red:set(key, json, "EX", SESSION_TTL)
+        end
+    end
+
+    _M.keepalive(red)
+    return true
+end
+
+--- Check if a session already exists
+function _M.session_exists(user_id, play_session_id)
+    if not user_id or not play_session_id then return false end
+
+    local red, err = _M.connect()
+    if not red then return false end
+
+    local key = "active_session:" .. user_id .. ":" .. play_session_id
+    local exists = red:exists(key)
+    _M.keepalive(red)
+
+    return exists == 1
+end
+
+--- Count active sessions for a user
+-- @return number
+function _M.count_user_sessions(user_id)
+    if not user_id then return 0 end
+
+    local red, err = _M.connect()
+    if not red then return 0 end
+
+    local count = 0
+    local cursor = "0"
+    local pattern = "active_session:" .. user_id .. ":*"
+
+    repeat
+        local res = red:scan(cursor, "MATCH", pattern, "COUNT", 100)
+        if not res then break end
+        cursor = res[1]
+        count = count + #res[2]
+    until cursor == "0"
+
+    _M.keepalive(red)
+    return count
+end
+
+--- Get all active sessions for a user
+-- @return table of {play_session_id, info}
+function _M.get_user_sessions(user_id)
+    if not user_id then return {} end
+
+    local red, err = _M.connect()
+    if not red then return {} end
+
+    local sessions = {}
+    local cursor = "0"
+    local pattern = "active_session:" .. user_id .. ":*"
+    local prefix_len = #("active_session:" .. user_id .. ":")
+
+    repeat
+        local res = red:scan(cursor, "MATCH", pattern, "COUNT", 100)
+        if not res then break end
+        cursor = res[1]
+        for _, key in ipairs(res[2]) do
+            local raw = red:get(key)
+            if raw and raw ~= ngx.null then
+                local info = cjson.decode(raw)
+                if info then
+                    info.play_session_id = key:sub(prefix_len + 1)
+                    sessions[#sessions + 1] = info
+                end
+            end
+        end
+    until cursor == "0"
+
+    _M.keepalive(red)
+    return sessions
+end
+
+--- Get ALL active sessions across all users (for heartbeat reporting)
+-- @return table
+function _M.scan_all_sessions()
+    local red, err = _M.connect()
+    if not red then return {} end
+
+    local sessions = {}
+    local cursor = "0"
+
+    repeat
+        local res = red:scan(cursor, "MATCH", "active_session:*", "COUNT", 200)
+        if not res then break end
+        cursor = res[1]
+        for _, key in ipairs(res[2]) do
+            local raw = red:get(key)
+            if raw and raw ~= ngx.null then
+                local info = cjson.decode(raw)
+                if info then
+                    -- Parse user_id and play_session_id from key
+                    local uid, psid = key:match("^active_session:(.+):([^:]+)$")
+                    if uid and psid then
+                        info.user_id = uid
+                        info.play_session_id = psid
+                        sessions[#sessions + 1] = info
+                    end
+                end
+            end
+        end
+    until cursor == "0"
+
+    _M.keepalive(red)
+    return sessions
+end
+
 -- ==================== Enforcement Operations ====================
 
 --- Store enforcements from UHDadmin

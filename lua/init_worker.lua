@@ -1,9 +1,11 @@
 -- init_worker.lua: Background timer workers (init_worker_by_lua_file)
 -- Starts periodic timers for:
 -- 1. Config pull from UHDadmin
--- 2. Telemetry flush (access logs + blocked requests)
+-- 2. Telemetry flush (access logs + blocked requests + token reports)
 -- 3. Quota sync (Redis counters → UHDadmin → remaining capacity back to Redis)
 -- 4. Heartbeat
+-- 5. Token resolve (Plan B: query Emby API for unknown tokens)
+-- 6. Session heartbeat (report active sessions to UHDadmin)
 
 local cjson = require("cjson.safe")
 local config = require("config")
@@ -14,13 +16,19 @@ local redis_store = require("redis_store")
 
 local UHDADMIN_URL = os.getenv("UHDADMIN_URL") or "http://localhost:8000"
 local APP_TOKEN = os.getenv("APP_TOKEN") or ""
-local AGENT_VERSION = "0.1.0"
+local AGENT_VERSION = "0.2.0"
+
+-- Emby/Jellyfin server direct access (for Plan B token resolve)
+local EMBY_API_KEY = os.getenv("EMBY_API_KEY") or ""
+local EMBY_SERVER_URL = os.getenv("EMBY_SERVER_URL") or ""
 
 -- Timer intervals (seconds)
 local CONFIG_PULL_INTERVAL = tonumber(os.getenv("CONFIG_PULL_INTERVAL")) or 30
 local TELEMETRY_FLUSH_INTERVAL = tonumber(os.getenv("TELEMETRY_FLUSH_INTERVAL")) or 60
 local QUOTA_SYNC_INTERVAL = tonumber(os.getenv("QUOTA_SYNC_INTERVAL")) or 300
 local HEARTBEAT_INTERVAL = tonumber(os.getenv("HEARTBEAT_INTERVAL")) or 60
+local TOKEN_RESOLVE_INTERVAL = tonumber(os.getenv("TOKEN_RESOLVE_INTERVAL")) or 30
+local SESSION_HEARTBEAT_INTERVAL = tonumber(os.getenv("SESSION_HEARTBEAT_INTERVAL")) or 30
 
 -- ==================== HTTP Client Helper ====================
 
@@ -64,6 +72,39 @@ local function api_request(method, path, body)
     end
 
     return data
+end
+
+--- HTTP request to Emby/Jellyfin server directly (for Plan B)
+local function emby_request(method, path)
+    if not EMBY_SERVER_URL or EMBY_SERVER_URL == "" then
+        return nil, "EMBY_SERVER_URL not configured"
+    end
+    if not EMBY_API_KEY or EMBY_API_KEY == "" then
+        return nil, "EMBY_API_KEY not configured"
+    end
+
+    local http = require("resty.http")
+    local httpc = http.new()
+    httpc:set_timeout(5000)
+
+    local url = EMBY_SERVER_URL .. path
+
+    local res, err = httpc:request_uri(url, {
+        method = method,
+        headers = {
+            ["X-Emby-Token"] = EMBY_API_KEY,
+            ["Content-Type"] = "application/json",
+        },
+    })
+
+    if not res then
+        return nil, err
+    end
+    if res.status >= 400 then
+        return nil, "HTTP " .. res.status
+    end
+
+    return cjson.decode(res.body)
 end
 
 -- ==================== Config Pull ====================
@@ -182,6 +223,31 @@ local function flush_telemetry(premature)
         end
     end
 
+    -- Flush pending token reports to UHDadmin
+    local token_reports = redis_store.scan_token_reports(100)
+    if #token_reports > 0 then
+        local events = {}
+        for _, t in ipairs(token_reports) do
+            events[#events + 1] = {
+                event_type = "login",
+                emby_user_id = t.user_id,
+                emby_username = t.username,
+                device_id = t.device_id,
+                device_name = t.device_name,
+                client_name = t.client_name,
+                client_version = t.client_version,
+                client_ip = t.client_ip or "unknown",
+                success = true,
+            }
+        end
+
+        for _, event in ipairs(events) do
+            api_request("POST", "/../slave/telemetry/login", event)
+        end
+
+        ngx.log(ngx.INFO, "Reported ", #events, " token/login events")
+    end
+
     local ok, timer_err = ngx.timer.at(TELEMETRY_FLUSH_INTERVAL, flush_telemetry)
     if not ok then
         ngx.log(ngx.ERR, "Failed to schedule telemetry flush timer: ", timer_err)
@@ -239,10 +305,122 @@ local function sync_quotas(premature)
     end
 end
 
+-- ==================== Token Resolve (Plan B) ====================
+-- Query Emby/Jellyfin Sessions API to build token→user mappings
+-- for tokens not captured during login (e.g., after Slave restart)
+
+local function resolve_tokens(premature)
+    if premature then return end
+
+    if not EMBY_SERVER_URL or EMBY_SERVER_URL == "" or
+       not EMBY_API_KEY or EMBY_API_KEY == "" then
+        goto schedule
+    end
+
+    do
+        local sessions, err = emby_request("GET", "/emby/Sessions")
+        if not sessions then
+            ngx.log(ngx.WARN, "Token resolve: failed to query Emby sessions: ", err)
+            goto schedule
+        end
+
+        local resolved = 0
+        for _, session in ipairs(sessions) do
+            local user_id = session.UserId
+            local device_id = session.DeviceId
+
+            if user_id and device_id then
+                -- Check if we already have a mapping for this device
+                -- (Sessions API doesn't return tokens directly, but we can
+                --  build device_id → user_id mappings as fallback)
+                local device_key = "device_user:" .. device_id
+                local red, redis_err = redis_store.connect()
+                if red then
+                    local existing = red:get(device_key)
+                    if not existing or existing == ngx.null then
+                        local info = {
+                            user_id = user_id,
+                            username = session.UserName,
+                            device_id = device_id,
+                            device_name = session.DeviceName,
+                            client_name = session.Client,
+                            client_version = session.ApplicationVersion,
+                            resolved_from = "emby_sessions_api",
+                        }
+                        red:set(device_key, cjson.encode(info), "EX", 604800)
+                        resolved = resolved + 1
+                    end
+                    redis_store.keepalive(red)
+                end
+            end
+        end
+
+        if resolved > 0 then
+            ngx.log(ngx.INFO, "Token resolve: resolved ", resolved, " device→user mappings from Emby sessions")
+        end
+    end
+
+    ::schedule::
+    local ok, timer_err = ngx.timer.at(TOKEN_RESOLVE_INTERVAL, resolve_tokens)
+    if not ok then
+        ngx.log(ngx.ERR, "Failed to schedule token resolve timer: ", timer_err)
+    end
+end
+
+-- ==================== Session Heartbeat ====================
+-- Report active streaming sessions to UHDadmin for cross-Slave coordination
+
+local function session_heartbeat(premature)
+    if premature then return end
+
+    -- Scan all active sessions from Redis
+    local sessions = redis_store.scan_all_sessions()
+
+    if #sessions > 0 then
+        -- Format for UHDadmin realtime heartbeat API
+        local session_data = {}
+        for _, s in ipairs(sessions) do
+            session_data[#session_data + 1] = {
+                session_id = s.play_session_id,
+                emby_user_id = s.user_id,
+                device_id = s.device_id,
+                device_name = s.device_name,
+                client_name = s.client_name,
+                client_ip = s.client_ip,
+                is_playing = true,
+                is_paused = false,
+                started_at = s.started_at,
+            }
+        end
+
+        local resp, err = api_request("POST", "/../slave/telemetry/realtime/heartbeat", {
+            sessions = session_data,
+        })
+
+        if not resp then
+            ngx.log(ngx.ERR, "Session heartbeat failed: ", err)
+        else
+            ngx.log(ngx.INFO, "Session heartbeat: ", #session_data, " active sessions reported")
+        end
+    else
+        -- Report empty to clear stale sessions
+        api_request("POST", "/../slave/telemetry/realtime/heartbeat", {
+            sessions = {},
+        })
+    end
+
+    local ok, timer_err = ngx.timer.at(SESSION_HEARTBEAT_INTERVAL, session_heartbeat)
+    if not ok then
+        ngx.log(ngx.ERR, "Failed to schedule session heartbeat timer: ", timer_err)
+    end
+end
+
 -- ==================== Heartbeat ====================
 
 local function send_heartbeat(premature)
     if premature then return end
+
+    local active_sessions = redis_store.scan_all_sessions()
 
     local resp, err = api_request("POST", "/heartbeat", {
         agent_version = AGENT_VERSION,
@@ -250,6 +428,7 @@ local function send_heartbeat(premature)
         status = "online",
         metadata = {
             telemetry = telemetry.get_counts(),
+            active_sessions = #active_sessions,
         },
     })
 
@@ -269,6 +448,9 @@ end
 if ngx.worker.id() == 0 then
     ngx.log(ngx.INFO, "UHD Slave agent v", AGENT_VERSION, " starting on worker 0")
     ngx.log(ngx.INFO, "UHDadmin URL: ", UHDADMIN_URL)
+    if EMBY_SERVER_URL ~= "" then
+        ngx.log(ngx.INFO, "Emby server URL: ", EMBY_SERVER_URL)
+    end
 
     -- Initial config pull (delay 1s to let nginx fully start)
     ngx.timer.at(1, pull_config)
@@ -277,9 +459,13 @@ if ngx.worker.id() == 0 then
     ngx.timer.at(5, flush_telemetry)
     ngx.timer.at(10, sync_quotas)
     ngx.timer.at(3, send_heartbeat)
+    ngx.timer.at(7, resolve_tokens)
+    ngx.timer.at(8, session_heartbeat)
 
     ngx.log(ngx.INFO, "Background timers scheduled: config=", CONFIG_PULL_INTERVAL,
             "s telemetry=", TELEMETRY_FLUSH_INTERVAL,
             "s quota=", QUOTA_SYNC_INTERVAL,
-            "s heartbeat=", HEARTBEAT_INTERVAL, "s")
+            "s heartbeat=", HEARTBEAT_INTERVAL,
+            "s token_resolve=", TOKEN_RESOLVE_INTERVAL,
+            "s session_hb=", SESSION_HEARTBEAT_INTERVAL, "s")
 end

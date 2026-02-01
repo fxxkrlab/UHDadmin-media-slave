@@ -6,6 +6,7 @@ RUN opm get ledgetech/lua-resty-http
 # Create directory structure
 RUN mkdir -p /opt/slave/conf \
              /opt/slave/lua/lib \
+             /opt/slave/lua/filters \
              /opt/slave/lua/modules \
              /opt/slave/templates \
              /var/log/openresty
@@ -30,6 +31,10 @@ ENV CONFIG_PULL_INTERVAL=30
 ENV TELEMETRY_FLUSH_INTERVAL=60
 ENV QUOTA_SYNC_INTERVAL=300
 ENV HEARTBEAT_INTERVAL=60
+ENV EMBY_API_KEY=""
+ENV EMBY_SERVER_URL=""
+ENV TOKEN_RESOLVE_INTERVAL=30
+ENV SESSION_HEARTBEAT_INTERVAL=30
 
 # Expose ports
 EXPOSE 80 443
