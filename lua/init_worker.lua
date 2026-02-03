@@ -16,7 +16,7 @@ local redis_store = require("redis_store")
 
 local UHDADMIN_URL = os.getenv("UHDADMIN_URL") or "http://localhost:8000"
 local APP_TOKEN = os.getenv("APP_TOKEN") or ""
-local AGENT_VERSION = "0.2.1"
+local AGENT_VERSION = "0.3.0"
 
 -- Emby/Jellyfin server direct access (for Plan B token resolve)
 local EMBY_API_KEY = os.getenv("EMBY_API_KEY") or ""

@@ -1,11 +1,11 @@
 version: "3.8"
 
-# Named Volume mode — configuration managed by Slave Agent (auto-pull from UHDadmin)
-# This is the recommended mode for production deployment
+# Bind Mount mode — all config and lua files mapped from host directory
+# Use this when you need direct access to configuration files on the host
 #
 # Usage:
 #   cp .env.example .env  # Edit .env with your settings
-#   docker compose up -d
+#   docker compose -f docker-compose.bind.yml up -d
 
 services:
   slave:
@@ -24,7 +24,14 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
-      # SSL certificates (mount from host)
+      # Nginx configuration (bind mount from host)
+      - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./conf/upstream.conf:/opt/slave/conf/upstream.conf
+      - ./conf/maps.conf:/opt/slave/conf/maps.conf
+      - ./conf/server.conf:/opt/slave/conf/server.conf
+      # Lua scripts (bind mount from host)
+      - ./lua:/opt/slave/lua
+      # SSL certificates
       - ${SSL_CERT_PATH:-./certs/cert.pem}:/etc/ssl/slave/cert.pem:ro
       - ${SSL_KEY_PATH:-./certs/key.pem}:/etc/ssl/slave/key.pem:ro
       # Logs
@@ -49,7 +56,7 @@ services:
       --save 60 100
       --loglevel warning
     volumes:
-      - redis-data:/data
+      - ./redis-data:/data
     networks:
       - uhd-network
     healthcheck:
@@ -57,9 +64,6 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
-
-volumes:
-  redis-data:
 
 networks:
   uhd-network:
