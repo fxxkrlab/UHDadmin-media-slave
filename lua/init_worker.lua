@@ -188,7 +188,10 @@ local function pull_config(premature)
             config.store_service_type(cfg_data.service_type)
         end
 
-        -- Multi-server mode: write rendered configs to disk and reload nginx
+        -- Write rendered configs to disk and reload nginx
+        -- rendered_nginx contains upstreams + maps + server blocks all-in-one,
+        -- so we must clear the separate upstream.conf and maps.conf to avoid
+        -- duplicate definitions (nginx.conf includes all three files).
         if cfg_data.rendered_nginx then
             local nginx_changed = false
 
@@ -200,6 +203,13 @@ local function pull_config(premature)
                     ngx.log(ngx.INFO, "Written rendered nginx config to server.conf")
                     nginx_changed = true
                 end
+
+                -- Clear upstream.conf and maps.conf to prevent duplicate definitions
+                write_file("/opt/slave/conf/upstream.conf",
+                    "# Managed by UHD Slave agent - included in server.conf\n")
+                write_file("/opt/slave/conf/maps.conf",
+                    "# Managed by UHD Slave agent - included in server.conf\n")
+                ngx.log(ngx.INFO, "Cleared upstream.conf and maps.conf (merged into server.conf)")
             end
 
             -- Write rendered lua if provided
