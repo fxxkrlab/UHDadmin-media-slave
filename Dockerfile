@@ -1,7 +1,15 @@
 FROM openresty/openresty:1.25.3.2-alpine
 
 # Install lua-resty-http for API communication
-RUN opm get ledgetech/lua-resty-http
+RUN apk add --no-cache curl unzip && \
+    mkdir -p /usr/local/openresty/site/lualib/resty && \
+    cd /tmp && \
+    curl -fSL https://github.com/ledgetech/lua-resty-http/archive/refs/tags/v0.17.2.tar.gz -o lua-resty-http.tar.gz && \
+    tar xzf lua-resty-http.tar.gz && \
+    cp lua-resty-http-0.17.2/lib/resty/http.lua /usr/local/openresty/site/lualib/resty/ && \
+    cp lua-resty-http-0.17.2/lib/resty/http_headers.lua /usr/local/openresty/site/lualib/resty/ && \
+    cp lua-resty-http-0.17.2/lib/resty/http_connect.lua /usr/local/openresty/site/lualib/resty/ 2>/dev/null || true && \
+    rm -rf /tmp/lua-resty-http*
 
 # Create directory structure
 RUN mkdir -p /opt/slave/conf \
