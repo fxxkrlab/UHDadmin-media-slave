@@ -107,6 +107,27 @@ local function emby_request(method, path)
     return cjson.decode(res.body)
 end
 
+-- ==================== File I/O Helper ====================
+
+local function write_file(path, content)
+    local f = io.open(path, "w")
+    if not f then
+        ngx.log(ngx.ERR, "Failed to open file for writing: ", path)
+        return false
+    end
+    f:write(content)
+    f:close()
+    return true
+end
+
+local function read_file(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    return content
+end
+
 -- ==================== Config Pull ====================
 
 local function pull_config(premature)
@@ -167,12 +188,49 @@ local function pull_config(premature)
             config.store_service_type(cfg_data.service_type)
         end
 
+        -- Multi-server mode: write rendered configs to disk and reload nginx
+        if cfg_data.rendered_nginx then
+            local nginx_changed = false
+
+            -- Read current server.conf to check if content differs
+            local current_conf = read_file("/opt/slave/conf/server.conf")
+            if current_conf ~= cfg_data.rendered_nginx then
+                local ok_write = write_file("/opt/slave/conf/server.conf", cfg_data.rendered_nginx)
+                if ok_write then
+                    ngx.log(ngx.INFO, "Written rendered nginx config to server.conf")
+                    nginx_changed = true
+                end
+            end
+
+            -- Write rendered lua if provided
+            if cfg_data.rendered_lua then
+                local current_lua = read_file("/opt/slave/lua/access.lua")
+                if current_lua ~= cfg_data.rendered_lua then
+                    write_file("/opt/slave/lua/access.lua", cfg_data.rendered_lua)
+                    ngx.log(ngx.INFO, "Written rendered lua config to access.lua")
+                    nginx_changed = true
+                end
+            end
+
+            -- Reload nginx if any config file changed
+            if nginx_changed then
+                local reload_ok = os.execute("openresty -t 2>/dev/null && openresty -s reload")
+                if reload_ok then
+                    ngx.log(ngx.INFO, "Nginx config reloaded (multi-server mode, ",
+                            cfg_data.sibling_count or "?", " servers)")
+                else
+                    ngx.log(ngx.ERR, "Nginx reload failed! Config may be invalid.")
+                end
+            end
+        end
+
         -- Store version
         if cfg_data.version then
             config.store_version(cfg_data.version)
         end
 
-        ngx.log(ngx.INFO, "Config updated to version ", cfg_data.version)
+        ngx.log(ngx.INFO, "Config updated to version ", cfg_data.version,
+                " mode=", cfg_data.mode or "single")
 
         -- Send ACK to UHDadmin
         if ver_data.snapshot_id then
