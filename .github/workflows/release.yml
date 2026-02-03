@@ -33,12 +33,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Extract version and lowercase image name
         id: version
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=$IMAGE_NAME_LOWER" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION, image: $IMAGE_NAME_LOWER"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -47,9 +49,9 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ steps.version.outputs.image }}:latest
+            ${{ env.REGISTRY }}/${{ steps.version.outputs.image }}:stable
+            ${{ env.REGISTRY }}/${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -61,7 +63,7 @@ jobs:
             ## Docker 镜像
 
             ```bash
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            docker pull ${{ env.REGISTRY }}/${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
             ```
 
             **标签:** `latest` | `stable` | `${{ steps.version.outputs.version }}`
